@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use crate::bitcoin::utxo::UnsignedMockTransaction;
 use crate::bitcoin::validation::BitcoinTxContext;
-use crate::block_observer::SignerSetInfo;
 use crate::context::Context;
 use crate::context::P2PEvent;
 use crate::context::SignerCommand;
@@ -33,6 +32,7 @@ use crate::message::StacksTransactionSignRequest;
 use crate::message::WstsMessageId;
 use crate::metrics::Metrics;
 use crate::network;
+use crate::stacks::api::SignerSetInfo;
 use crate::stacks::contracts::AsContractCall as _;
 use crate::stacks::contracts::ContractCall;
 use crate::stacks::contracts::ReqContext;
@@ -43,6 +43,7 @@ use crate::stacks::wallet::SignerWallet;
 use crate::storage::DbRead;
 use crate::storage::DbWrite as _;
 use crate::storage::model;
+use crate::storage::model::BitcoinBlockHash;
 use crate::storage::model::DkgSharesStatus;
 use crate::storage::model::SigHash;
 use crate::wsts_state_machine::FrostCoordinator;
@@ -54,7 +55,6 @@ use bitcoin::TapSighash;
 use bitcoin::hashes::Hash as _;
 use futures::StreamExt;
 use lru::LruCache;
-use rand::rngs::OsRng;
 use wsts::net::DkgEnd;
 use wsts::net::DkgStatus;
 use wsts::net::Message as WstsNetMessage;
@@ -140,6 +140,9 @@ pub struct TxSignerEventLoop<Context, Network, Rng> {
     pub wsts_state_machines: LruCache<StateMachineId, SignerStateMachine>,
     /// The threshold for the signer
     pub threshold: u32,
+    /// Last bitcoin block for which the signer has already processed
+    /// presign request.
+    pub last_presign_block: Option<BitcoinBlockHash>,
     /// How many bitcoin blocks back from the chain tip the signer will look for requests.
     pub context_window: u16,
     /// Random number generator used for encryption
@@ -269,6 +272,7 @@ where
             context_window,
             wsts_state_machines: LruCache::new(max_state_machines),
             threshold,
+            last_presign_block: None,
             rng,
             dkg_begin_pause,
             dkg_verification_state_machines: LruCache::new(
@@ -380,9 +384,10 @@ where
     ) -> Result<MsgChainTipReport, Error> {
         let storage = self.context.get_storage();
 
-        let chain_tip = storage
-            .get_bitcoin_canonical_chain_tip_ref()
-            .await?
+        let chain_tip = self
+            .context
+            .state()
+            .bitcoin_chain_tip()
             .ok_or(Error::NoChainTip)?;
 
         let is_known = storage
@@ -424,6 +429,11 @@ where
         chain_tip: &model::BitcoinBlockRef,
     ) -> Result<(), Error> {
         let db = self.context.get_storage_mut();
+
+        if self.last_presign_block == Some(chain_tip.block_hash) {
+            return Err(Error::InvalidPresignRequest(chain_tip.block_hash));
+        }
+        self.last_presign_block = Some(chain_tip.block_hash);
 
         let aggregate_key = self
             .context
@@ -471,6 +481,7 @@ where
 
         self.send_message(BitcoinPreSignAck, &chain_tip.block_hash)
             .await?;
+
         Ok(())
     }
 
@@ -552,20 +563,29 @@ where
 
         let db = self.context.get_storage();
         let public_key = self.signer_public_key();
+        let state = self.context.state();
 
         // There is one check that applies to all Stacks transactions, and
         // that check is that the current signer is in the signing set
-        // associated authorized wallet in the sbtc registry. We do this
-        // check here. If we are in the bootstrap phase, there may not be
-        // any signer set info in the registry so we fallback on the
-        // information in latest verified DKG shares in that case.
-        let signer_set_info = match self.context.state().registry_signer_set_info() {
+        // associated authorized wallet in the sbtc registry.
+        //
+        // If the sbtc-registry has not been deployed yet, then we allow
+        // any DKG shares for smart contract deployments, but require
+        // verified DKG shares for other transactions.
+        let signer_set_info = match state.registry_signer_set_info() {
             Some(info) => info,
-            None => db
-                .get_latest_verified_dkg_shares()
-                .await?
-                .map(SignerSetInfo::from)
-                .ok_or_else(|| Error::NoDkgShares)?,
+            None => match db.get_latest_verified_dkg_shares().await? {
+                Some(info) => info.into(),
+                None if matches!(request.contract_tx, StacksTx::SmartContract(_))
+                    && !state.sbtc_contracts_deployed() =>
+                {
+                    db.get_latest_encrypted_dkg_shares()
+                        .await?
+                        .map(SignerSetInfo::from)
+                        .ok_or(Error::NoDkgShares)?
+                }
+                _ => return Err(Error::NoVerifiedDkgShares),
+            },
         };
 
         if !signer_set_info.signer_set.contains(&public_key) {
@@ -663,6 +683,7 @@ where
                 let state_machine = SignerStateMachine::new(
                     signer_public_keys,
                     threshold,
+                    *chain_tip,
                     self.signer_private_key,
                 )?;
                 let state_machine_id = StateMachineId::Dkg(*chain_tip);
@@ -1155,15 +1176,13 @@ where
         signer_id: u32,
         sender_public_key: &PublicKey,
     ) -> Result<(), Error> {
-        let public_keys = match self.wsts_state_machines.get(state_machine_id) {
-            Some(state_machine) => &state_machine.public_keys,
+        let state_machine = match self.wsts_state_machines.get(state_machine_id) {
+            Some(state_machine) => state_machine,
             None => return Err(Error::MissingStateMachine(*state_machine_id)),
         };
 
-        let wsts_public_key = public_keys
-            .signers
-            .get(&signer_id)
-            .map(PublicKey::from)
+        let wsts_public_key = state_machine
+            .get_signer_public_key(signer_id)
             .ok_or(Error::MissingPublicKey)?;
 
         if &wsts_public_key != sender_public_key {
@@ -1201,12 +1220,11 @@ where
             .get(state_machine_id)
             .ok_or_else(|| Error::MissingStateMachine(*state_machine_id))?;
 
-        let StateMachineId::Dkg(started_at) = state_machine_id else {
+        let StateMachineId::Dkg(_) = state_machine_id else {
             return Err(Error::UnexpectedStateMachineId(*state_machine_id));
         };
 
-        let encrypted_dkg_shares =
-            state_machine.get_encrypted_dkg_shares(&mut self.rng, started_at)?;
+        let encrypted_dkg_shares = state_machine.get_encrypted_dkg_shares()?;
 
         tracing::debug!("🔐 storing DKG shares");
         self.context
@@ -1461,8 +1479,6 @@ where
         msg: &WstsNetMessage,
         bitcoin_chain_tip: &model::BitcoinBlockHash,
     ) -> Result<(), Error> {
-        let mut rng = OsRng;
-
         // Validate that the sender is a valid member of the signing set and
         // has the correct id according to the signer state machine.
         if let Some(signer_id) = signer_id {
@@ -1471,7 +1487,7 @@ where
 
         // Process the message in the WSTS signer state machine.
         let outbound_messages = match self.wsts_state_machines.get_mut(state_machine_id) {
-            Some(state_machine) => state_machine.process(msg, &mut rng).map_err(Error::Wsts)?,
+            Some(state_machine) => state_machine.process(msg)?,
             None => {
                 tracing::warn!("missing signing round");
                 return Err(Error::MissingStateMachine(*state_machine_id));
@@ -1502,8 +1518,7 @@ where
             self.wsts_state_machines
                 .get_mut(state_machine_id)
                 .ok_or_else(|| Error::MissingStateMachine(*state_machine_id))?
-                .process(outbound_message, &mut rng)
-                .map_err(Error::Wsts)?;
+                .process(outbound_message)?;
 
             // If this is a DKG verification then we need to process the message
             // in the FROST state machine as well for it to properly follow
@@ -1860,6 +1875,7 @@ mod tests {
             context_window: 1,
             wsts_state_machines: LruCache::new(NonZeroUsize::new(100).unwrap()),
             threshold: 1,
+            last_presign_block: None,
             rng: rand::rngs::OsRng,
             dkg_begin_pause: None,
             dkg_verification_state_machines: LruCache::new(NonZeroUsize::new(5).unwrap()),
@@ -1927,6 +1943,7 @@ mod tests {
             signer_private_key: PrivateKey::new(&mut rand::rngs::OsRng),
             context_window: 1,
             wsts_state_machines: LruCache::new(NonZeroUsize::new(100).unwrap()),
+            last_presign_block: None,
             threshold: 1,
             rng: rand::rngs::OsRng,
             dkg_begin_pause: None,
@@ -2014,6 +2031,7 @@ mod tests {
             context_window: 1,
             wsts_state_machines: LruCache::new(NonZeroUsize::new(100).unwrap()),
             threshold: 1,
+            last_presign_block: None,
             rng: rand::rngs::OsRng,
             dkg_begin_pause: None,
             dkg_verification_state_machines: LruCache::new(NonZeroUsize::new(5).unwrap()),
